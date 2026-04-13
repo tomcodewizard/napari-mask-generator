@@ -1,18 +1,11 @@
+# src/napari_mask_generator/__init__.py
+from importlib.metadata import PackageNotFoundError, version
+
 try:
-    from ._version import version as __version__
-except ImportError:
-    __version__ = 'unknown'
+    __version__ = version("napari-mask-generator")
+except PackageNotFoundError:
+    __version__ = "uninstalled"
 
-from ._widget import (
-    ExampleQWidget,
-    ImageThreshold,
-    threshold_autogenerate_widget,
-    threshold_magic_widget,
-)
 
-__all__ = (
-    'ExampleQWidget',
-    'ImageThreshold',
-    'threshold_autogenerate_widget',
-    'threshold_magic_widget',
-)
+def activate(context):
+    pass
