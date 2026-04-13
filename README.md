@@ -46,8 +46,9 @@ pip install git+https://github.com/tomcodewizard/napari-mask-generator.git
 
 ## Usage
 
-![napari_mask_generator_demonstration_gif](https://github.com/user-attachments/assets/b0805d8b-5612-44e2-9df5-d2bacabe0161)
-
+<div align="center">
+  <img src="https://github.com/user-attachments/assets/b0805d8b-5612-44e2-9df5-d2bacabe0161" width="500">
+<\div>
 
 
 ## Contributing
