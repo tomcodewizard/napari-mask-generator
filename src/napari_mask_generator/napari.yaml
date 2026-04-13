@@ -1,0 +1,36 @@
+name: napari-mask-generator
+display_name: Mask Generator
+# use 'hidden' to remove plugin from napari hub search results
+visibility: public
+# see https://napari.org/stable/plugins/technical_references/manifest.html#fields for valid categories
+# categories: []
+contributions:
+  commands:
+    - id: napari-mask-generator.make_container_widget
+      python_name: napari_mask_generator:ImageThreshold
+      title: Make threshold Container widget
+    - id: napari-mask-generator.make_magic_widget
+      python_name: napari_mask_generator:threshold_magic_widget
+      title: Make threshold magic widget
+    - id: napari-mask-generator.make_function_widget
+      python_name: napari_mask_generator:threshold_autogenerate_widget
+      title: Make threshold function widget
+    - id: napari-mask-generator.make_qwidget
+      python_name: napari_mask_generator:ExampleQWidget
+      title: Make example QWidget
+  widgets:
+    - command: napari-mask-generator.make_container_widget
+      display_name: Container Threshold
+    - command: napari-mask-generator.make_magic_widget
+      display_name: Magic Threshold
+    - command: napari-mask-generator.make_function_widget
+      autogenerate: true
+      display_name: Autogenerate Threshold
+    - command: napari-mask-generator.make_qwidget
+      display_name: Example QWidget
+  menus:
+    napari/layers/segment:
+      - command: napari-mask-generator.make_container_widget
+      - command: napari-mask-generator.make_magic_widget
+      - command: napari-mask-generator.make_function_widget
+      - command: napari-mask-generator.make_qwidget
