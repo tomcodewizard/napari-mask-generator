@@ -522,26 +522,26 @@ class MaskGenWidget(Container):
         # Instance masks
         export_instance_tiff(
             instance_mask,
-            path=str(dirs["instance"] / f"{filename}.tiff")
+            path=str(dirs["instance"] / f"{filename}_instance_mask.tiff")
         )
 
         # Semantic masks
         export_semantic_tiff(
             instance_mask,
-            path=str(dirs["semantic"] / f"{filename}.tiff")
+            path=str(dirs["semantic"] / f"{filename}_semantic_mask.tiff")
         )
 
         # Boundary masks
         export_boundary_tiff(
             instance_mask,
-            path=str(dirs["boundaries"] / f"{filename}.tiff")
+            path=str(dirs["boundaries"] / f"{filename}_boundary_mask.tiff")
         )
 
         # Boundary overlay
         export_boundary_overlay_tiff(
             instance_mask,
             image,
-            path=str(dirs["overlay"] / f"{filename}.tiff")
+            path=str(dirs["overlay"] / f"{filename}_boundary_overlay.tiff")
         )
 
         # COCO JSON
@@ -549,14 +549,14 @@ class MaskGenWidget(Container):
             instance_mask,
             self._accepted_masks,
             image_shape=instance_mask.shape,
-            path=str(dirs["coco"] / f"{filename}.json")
+            path=str(dirs["coco"] / f"{filename}_coco_json.json")
         )
 
         # Cellpose
         export_cellpose_npy(
             instance_mask,
             image,
-            path=str(dirs["cellpose"] / f"{filename}.npy")
+            path=str(dirs["cellpose"] / f"{filename}_cellpose.npy")
         )
 
         # Per-cell statistics CSV
