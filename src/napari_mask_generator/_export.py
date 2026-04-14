@@ -368,4 +368,4 @@ def export_summary_json(
         json.dump(summary, f, indent=2)
 
     print(f"Saved summary JSON:     {path}")
-    return summary
+    return summary 
