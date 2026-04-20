@@ -188,6 +188,7 @@ def export_coco_json(
             "image_id":     1,
             # category_id=2 flags uncertain to DL framework
             "category_id":  2 if is_uncertain else 1,
+            "cell": 1,
             "segmentation": [segmentation],
             "area":         float(np.sum(cell_mask)),
             "bbox": [
