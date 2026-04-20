@@ -17,10 +17,11 @@ class MaskGenWidget(Container):
             default_save_folder: str = str(Path.home())
     ):
         super().__init__()
-        self._viewer         = viewer
-        self._accepted_masks = {}
-        self._next_cell_id   = 1
-        self._image_shape    = None
+        self._viewer          = viewer
+        self._accepted_masks  = {}
+        self._uncertain_masks = {}
+        self._next_cell_id    = 1
+        self._image_shape     = None
 
         self.native.setMaximumWidth(280)
         self.native.setMinimumWidth(220)
@@ -40,7 +41,6 @@ class MaskGenWidget(Container):
         )
         self._counter_label.native.setMaximumWidth(260)
 
-        # Use passed defaults here
         self._filename_input = LineEdit(
             label="Filename",
             value=default_filename
@@ -53,7 +53,6 @@ class MaskGenWidget(Container):
         )
         self._save_dir_input.native.setMaximumWidth(260)
 
-        # --- rest of __init__ unchanged from here ---
         self._zoom_checkbox = CheckBox(
             label="Zoom to cell on accept",
             value=False
@@ -66,24 +65,31 @@ class MaskGenWidget(Container):
         )
         self._labels_checkbox.native.setMaximumWidth(260)
 
-        self._start_button  = PushButton(label="Start Drawing")
-        self._accept_button = PushButton(label="Accept Polygon")
-        self._reject_button = PushButton(label="Reject Polygon")
-        self._undo_button   = PushButton(label="Undo Last")
-        self._save_button   = PushButton(label="Save Masks")
-        self._load_button   = PushButton(label="Load Session")
+        # --- Buttons ---
+        self._start_button     = PushButton(label="Start Drawing")
+        self._accept_button    = PushButton(label="Accept Polygon")
+        self._reject_button    = PushButton(label="Reject Polygon")
+        self._uncertain_button = PushButton(
+            label="Uncertain (flag cell)"
+        )
+        self._undo_button      = PushButton(label="Undo Last")
+        self._save_button      = PushButton(label="Save Masks")
+        self._load_button      = PushButton(label="Load Session")
 
         for btn in [
-            self._start_button, self._accept_button,
-            self._reject_button, self._undo_button,
-            self._save_button,  self._load_button,
+            self._start_button,     self._accept_button,
+            self._reject_button,    self._uncertain_button,
+            self._undo_button,      self._save_button,
+            self._load_button,
         ]:
             btn.native.setMaximumWidth(260)
 
-        self._accept_button.enabled = False
-        self._reject_button.enabled = False
-        self._undo_button.enabled   = False
-        self._save_button.enabled   = False
+        # Disable until started
+        self._accept_button.enabled    = False
+        self._reject_button.enabled    = False
+        self._uncertain_button.enabled = False
+        self._undo_button.enabled      = False
+        self._save_button.enabled      = False
 
         self.extend([
             self._status_label,
@@ -95,17 +101,33 @@ class MaskGenWidget(Container):
             self._start_button,
             self._accept_button,
             self._reject_button,
+            self._uncertain_button,
             self._undo_button,
             self._save_button,
             self._load_button,
         ])
 
-        self._start_button.clicked.connect(self._start_drawing)
-        self._accept_button.clicked.connect(self._accept_polygon)
-        self._reject_button.clicked.connect(self._reject_polygon)
-        self._undo_button.clicked.connect(self._undo_last)
-        self._save_button.clicked.connect(self._save_masks)
-        self._load_button.clicked.connect(self._load_session)
+        # Connect buttons - disconnect first to prevent
+        # double connections if widget is recreated
+        for btn, callback in [
+            (self._start_button,     self._start_drawing),
+            (self._accept_button,    self._accept_polygon),
+            (self._reject_button,    self._reject_polygon),
+            (self._uncertain_button, self._mark_uncertain),
+            (self._undo_button,      self._undo_last),
+            (self._save_button,      self._save_masks),
+            (self._load_button,      self._load_session),
+        ]:
+            try:
+                btn.clicked.disconnect()
+            except Exception:
+                pass
+            btn.clicked.connect(callback)
+
+        try:
+            self._labels_checkbox.changed.disconnect()
+        except Exception:
+            pass
         self._labels_checkbox.changed.connect(
             self._update_cell_labels
         )
@@ -131,17 +153,15 @@ class MaskGenWidget(Container):
         shape = image_layer.data.shape
         ndim  = len(shape)
         print(f"Raw image shape: {shape}")
-
         if ndim == 2:
             h, w = shape
         elif ndim == 3:
             if shape[2] in (3, 4):
-                h, w = shape[0], shape[1]  # (H, W, C)
+                h, w = shape[0], shape[1]
             else:
-                h, w = shape[1], shape[2]  # (C, H, W)
+                h, w = shape[1], shape[2]
         else:
             h, w = shape[-2], shape[-1]
-
         print(f"2D mask shape: ({h}, {w})")
         return (h, w)
 
@@ -151,25 +171,22 @@ class MaskGenWidget(Container):
 
         h, w = self._image_shape
         mask = np.zeros((h, w), dtype=np.int32)
-
         for cell_id, poly in self._accepted_masks.items():
             coords      = poly[:, :2].astype(int)
             coords[:,0] = np.clip(coords[:,0], 0, h-1)
             coords[:,1] = np.clip(coords[:,1], 0, w-1)
             try:
-                rr, cc      = skimage_polygon(
+                rr, cc = skimage_polygon(
                     coords[:,0], coords[:,1], (h, w)
                 )
                 if len(rr) > 0:
                     mask[rr, cc] = cell_id
             except Exception as e:
                 print(f"Rasterise error cell {cell_id}: {e}")
-
         return mask
 
     def _update_labels_layer(self):
         """Remove and re-add the Instance Masks Labels layer."""
-        h, w     = self._image_shape
         new_mask = self._build_mask()
 
         if "Instance Masks" in self._viewer.layers:
@@ -197,17 +214,14 @@ class MaskGenWidget(Container):
 
     def _update_cell_labels(self):
         """
-        Show or hide cell name labels (Cell 1, Cell 2 etc.)
-        as a Points layer with text overlaid on each cell centroid.
-        Controlled by the Show cell name labels checkbox.
+        Show or hide cell name labels as a Points layer.
+        Certain cells labelled white, uncertain cells orange.
         """
         from skimage.measure import regionprops
 
-        # Remove existing labels layer
         if "Cell Labels" in self._viewer.layers:
             self._viewer.layers.remove("Cell Labels")
 
-        # If checkbox is off or no masks, do nothing
         if (not self._labels_checkbox.value or
                 not self._accepted_masks):
             return
@@ -217,36 +231,40 @@ class MaskGenWidget(Container):
             r.label: r
             for r in regionprops(mask.astype(np.int32))
         }
-
         if not props:
             return
 
-        # Build points at centroids with text labels
-        centroids  = []
+        centroids   = []
         text_labels = []
+        text_colors = []
 
         for cell_id in sorted(self._accepted_masks.keys()):
             if cell_id in props:
                 p = props[cell_id]
                 centroids.append([p.centroid[0], p.centroid[1]])
                 text_labels.append(f"Cell {cell_id}")
+                # Orange for uncertain, white for certain
+                text_colors.append(
+                    "orange"
+                    if cell_id in self._uncertain_masks
+                    else "white"
+                )
 
         if not centroids:
             return
 
         centroids = np.array(centroids)
 
-        # Add as Points layer with text
-        points_layer = self._viewer.add_points(
+        self._viewer.add_points(
             centroids,
             name="Cell Labels",
             text={
                 "string": text_labels,
                 "size":   12,
-                "color":  "white",
+                "color":  text_colors,
                 "anchor": "center",
             },
-            size=0,          # invisible point, only show text
+            size=0,
             opacity=1.0,
         )
 
@@ -262,10 +280,7 @@ class MaskGenWidget(Container):
     # ------------------------------------------------------------------
 
     def _zoom_to_last_accepted(self):
-        """
-        Zoom and centre the view on the last accepted polygon
-        if the zoom checkbox is ticked.
-        """
+        """Zoom to last accepted polygon if checkbox is on."""
         if not self._zoom_checkbox.value:
             return
         if not self._accepted_masks:
@@ -275,29 +290,30 @@ class MaskGenWidget(Container):
         poly    = self._accepted_masks[last_id]
         coords  = poly[:, :2]
 
-        # Get bounding box of polygon
-        r_min = coords[:,0].min()
-        r_max = coords[:,0].max()
-        c_min = coords[:,1].min()
-        c_max = coords[:,1].max()
-
-        # Centre of polygon
+        r_min    = coords[:,0].min()
+        r_max    = coords[:,0].max()
+        c_min    = coords[:,1].min()
+        c_max    = coords[:,1].max()
         centre_r = (r_min + r_max) / 2
         centre_c = (c_min + c_max) / 2
-
-        # Calculate zoom level based on polygon size
-        # Add 50% padding around the polygon
         h_poly   = (r_max - r_min) * 1.5
         w_poly   = (c_max - c_min) * 1.5
-        h_canvas = self._viewer.window.qt_viewer.canvas.size[1]
-        w_canvas = self._viewer.window.qt_viewer.canvas.size[0]
 
-        if h_poly > 0 and w_poly > 0:
-            zoom = min(
-                h_canvas / h_poly,
-                w_canvas / w_poly
+        try:
+            h_canvas = (
+                self._viewer.window.qt_viewer.canvas.size[1]
             )
-        else:
+            w_canvas = (
+                self._viewer.window.qt_viewer.canvas.size[0]
+            )
+            if h_poly > 0 and w_poly > 0:
+                zoom = min(
+                    h_canvas / h_poly,
+                    w_canvas / w_poly
+                )
+            else:
+                zoom = 5.0
+        except Exception:
             zoom = 5.0
 
         self._viewer.camera.center = (centre_r, centre_c)
@@ -321,21 +337,17 @@ class MaskGenWidget(Container):
         h, w              = self._image_shape
 
         for name in [
-            "Draw Polygons Here",
-            "Instance Masks",
-            "Cell Labels"
+            "Draw Polygons Here", "Instance Masks", "Cell Labels"
         ]:
             if name in self._viewer.layers:
                 self._viewer.layers.remove(name)
 
-        # Blank Labels layer
         self._viewer.add_labels(
             np.zeros((h, w), dtype=np.int32),
             name="Instance Masks",
             opacity=0.7
         )
 
-        # Drawing Shapes layer on top
         drawing = self._viewer.add_shapes(
             name="Draw Polygons Here",
             edge_color="cyan",
@@ -344,19 +356,23 @@ class MaskGenWidget(Container):
         )
         self._viewer.layers.selection.active = drawing
 
-        self._accepted_masks = {}
-        self._next_cell_id   = 1
+        self._accepted_masks  = {}
+        self._uncertain_masks = {}
+        self._next_cell_id    = 1
         self._update_counter()
 
-        self._accept_button.enabled = True
-        self._reject_button.enabled = True
-        self._save_button.enabled   = True
-        self._undo_button.enabled   = False
+        # Disable start, enable drawing buttons
+        self._start_button.enabled     = False
+        self._accept_button.enabled    = True
+        self._reject_button.enabled    = True
+        self._uncertain_button.enabled = True
+        self._save_button.enabled      = True
+        self._undo_button.enabled      = False
 
         self._status_label.value = (
             "Select polygon tool in toolbar.\n"
             "Draw polygon, double-click to finish.\n"
-            "Then click Accept or Reject."
+            "Then click Accept, Reject or Uncertain."
         )
 
     # ------------------------------------------------------------------
@@ -364,15 +380,15 @@ class MaskGenWidget(Container):
     # ------------------------------------------------------------------
 
     def _accept_polygon(self):
-        """Accept last drawn polygon."""
+        """Accept last drawn polygon as a certain cell."""
         from skimage.draw import polygon as skimage_polygon
 
         if "Draw Polygons Here" not in self._viewer.layers:
             self._status_label.value = "Click Start Drawing first!"
             return
 
-        drawing  = self._viewer.layers["Draw Polygons Here"]
-        n        = len(drawing.data)
+        drawing = self._viewer.layers["Draw Polygons Here"]
+        n       = len(drawing.data)
         print(f"[ACCEPT] {n} shapes, cell_id={self._next_cell_id}")
 
         if n == 0:
@@ -395,20 +411,18 @@ class MaskGenWidget(Container):
             )
             return
 
-        cell_id = self._next_cell_id
+        cell_id                       = self._next_cell_id
         self._accepted_masks[cell_id] = poly
+        # NOT added to _uncertain_masks - this is a certain cell
 
-        # Update Labels layer
         self._update_labels_layer()
 
-        # Update cell name labels if checkbox is on
         if self._labels_checkbox.value:
             self._update_cell_labels()
 
-        # Zoom to cell if checkbox is on
         self._zoom_to_last_accepted()
 
-        # Turn accepted polygon green
+        # Turn polygon GREEN
         try:
             idx     = n - 1
             ec      = np.array(drawing.edge_color)
@@ -420,9 +434,7 @@ class MaskGenWidget(Container):
         except Exception as e:
             print(f"Recolour error: {e}")
 
-        # Keep drawing layer selected
         self._viewer.layers.selection.active = drawing
-
         self._next_cell_id += 1
         self._undo_button.enabled = True
         self._update_counter()
@@ -432,10 +444,86 @@ class MaskGenWidget(Container):
         )
 
     # ------------------------------------------------------------------
+    # Mark Uncertain
+    # ------------------------------------------------------------------
+
+    def _mark_uncertain(self):
+        """
+        Mark last drawn polygon as uncertain.
+        Stored in both accepted_masks and uncertain_masks.
+        Displayed orange. Flagged as iscrowd=1 in COCO export.
+        DL frameworks ignore iscrowd=1 during training.
+        """
+        from skimage.draw import polygon as skimage_polygon
+
+        if "Draw Polygons Here" not in self._viewer.layers:
+            self._status_label.value = "Click Start Drawing first!"
+            return
+
+        drawing = self._viewer.layers["Draw Polygons Here"]
+        n       = len(drawing.data)
+
+        if n == 0:
+            self._status_label.value = "Draw a polygon first!"
+            return
+
+        poly   = drawing.data[-1].copy()
+        coords = poly[:, :2].astype(int)
+        h, w   = self._image_shape
+
+        coords[:,0] = np.clip(coords[:,0], 0, h-1)
+        coords[:,1] = np.clip(coords[:,1], 0, w-1)
+
+        rr, cc = skimage_polygon(coords[:,0], coords[:,1], (h,w))
+
+        if len(rr) == 0:
+            self._status_label.value = (
+                "Polygon too small! Draw larger."
+            )
+            return
+
+        cell_id = self._next_cell_id
+
+        # Store in BOTH dicts
+        self._accepted_masks[cell_id]  = poly
+        self._uncertain_masks[cell_id] = poly
+
+        self._update_labels_layer()
+
+        if self._labels_checkbox.value:
+            self._update_cell_labels()
+
+        self._zoom_to_last_accepted()
+
+        # Turn polygon ORANGE
+        try:
+            idx     = n - 1
+            ec      = np.array(drawing.edge_color)
+            fc      = np.array(drawing.face_color)
+            ec[idx] = [1.0, 0.5, 0.0, 1.0]
+            fc[idx] = [1.0, 0.5, 0.0, 0.15]
+            drawing.edge_color = ec
+            drawing.face_color = fc
+        except Exception as e:
+            print(f"Recolour error: {e}")
+
+        self._viewer.layers.selection.active = drawing
+        self._next_cell_id   += 1
+        self._undo_button.enabled = True
+        self._update_counter()
+        self._status_label.value = (
+            f"Cell {cell_id} flagged uncertain (orange).\n"
+            f"Will be ignored in DL training.\n"
+            f"Next label: {self._next_cell_id}"
+        )
+        print(f"[UNCERTAIN] cell_id={cell_id}")
+
+    # ------------------------------------------------------------------
     # Reject
     # ------------------------------------------------------------------
 
     def _reject_polygon(self):
+        """Remove last drawn polygon without saving."""
         if "Draw Polygons Here" not in self._viewer.layers:
             self._status_label.value = "Click Start Drawing first!"
             return
@@ -451,12 +539,18 @@ class MaskGenWidget(Container):
     # ------------------------------------------------------------------
 
     def _undo_last(self):
+        """Remove last accepted mask (certain or uncertain)."""
         if not self._accepted_masks:
             self._status_label.value = "Nothing to undo."
             return
 
         last_id = max(self._accepted_masks.keys())
         del self._accepted_masks[last_id]
+
+        # Also remove from uncertain if it was flagged
+        if last_id in self._uncertain_masks:
+            del self._uncertain_masks[last_id]
+
         self._next_cell_id = last_id
 
         if "Draw Polygons Here" in self._viewer.layers:
@@ -506,88 +600,190 @@ class MaskGenWidget(Container):
             if isinstance(l, Image)
         ]
         image    = image_layers[0].data if image_layers else None
-
-        # Base output directory (chosen by user)
         base_dir = Path(self._save_dir_input.value.strip())
         filename = (
             self._filename_input.value.strip() or "cell_masks"
         )
 
-        # Create all subdirectories
-        dirs = get_output_dirs(base_dir)
-        print(f"\nSaving to: {base_dir}")
-        print(f"Filename:  {filename}")
+        print(f"\n[SAVE] filename={filename}")
+        print(f"[SAVE] base_dir={base_dir}")
+        print(f"[SAVE] accepted={len(self._accepted_masks)}")
+        print(f"[SAVE] uncertain={len(self._uncertain_masks)}")
 
-        # Save to each subdirectory
-        # Instance masks
-        export_instance_tiff(
-            instance_mask,
-            path=str(dirs["instance"] / f"{filename}_instance_mask.tiff")
-        )
+        # Check base dir accessible
+        if not base_dir.exists():
+            try:
+                base_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                self._status_label.value = (
+                    f"Cannot create folder:\n{e}"
+                )
+                return
 
-        # Semantic masks
-        export_semantic_tiff(
-            instance_mask,
-            path=str(dirs["semantic"] / f"{filename}_semantic_mask.tiff")
-        )
+        try:
+            dirs = get_output_dirs(base_dir)
+        except Exception as e:
+            self._status_label.value = (
+                f"Failed to create dirs:\n{e}"
+            )
+            return
 
-        # Boundary masks
-        export_boundary_tiff(
-            instance_mask,
-            path=str(dirs["boundaries"] / f"{filename}_boundary_mask.tiff")
-        )
+        saved  = []
+        failed = []
 
-        # Boundary overlay
-        export_boundary_overlay_tiff(
-            instance_mask,
-            image,
-            path=str(dirs["overlay"] / f"{filename}_boundary_overlay.tiff")
-        )
+        # Uncertain IDs for flagging
+        uncertain_ids = set(self._uncertain_masks.keys())
 
-        # COCO JSON
-        export_coco_json(
-            instance_mask,
-            self._accepted_masks,
-            image_shape=instance_mask.shape,
-            path=str(dirs["coco"] / f"{filename}_coco_json.json")
-        )
+        for label, fn, args, kwargs in [
+            (
+                "instance_mask",
+                export_instance_tiff,
+                [instance_mask],
+                {"path": str(
+                    dirs["instance"] /
+                    f"{filename}_instance_mask.tiff"
+                )}
+            ),
+            (
+                "semantic_mask",
+                export_semantic_tiff,
+                [instance_mask],
+                {"path": str(
+                    dirs["semantic"] /
+                    f"{filename}_semantic_mask.tiff"
+                )}
+            ),
+            (
+                "boundary_mask",
+                export_boundary_tiff,
+                [instance_mask],
+                {"path": str(
+                    dirs["boundaries"] /
+                    f"{filename}_boundary_mask.tiff"
+                )}
+            ),
+            (
+                "boundary_overlay",
+                export_boundary_overlay_tiff,
+                [instance_mask, image],
+                {"path": str(
+                    dirs["overlay"] /
+                    f"{filename}_boundary_overlay.tiff"
+                )}
+            ),
+            (
+                "coco_json",
+                export_coco_json,
+                [instance_mask, self._accepted_masks],
+                {
+                    "image_shape":    instance_mask.shape,
+                    "path":           str(
+                        dirs["coco"] /
+                        f"{filename}_coco_annotation.json"
+                    ),
+                    "uncertain_ids":  uncertain_ids
+                }
+            ),
+            (
+                "cellpose",
+                export_cellpose_npy,
+                [instance_mask, image],
+                {"path": str(
+                    dirs["cellpose"] /
+                    f"{filename}_cellpose.npy"
+                )}
+            ),
+        ]:
+            try:
+                print(f"[SAVE] {label}...")
+                fn(*args, **kwargs)
+                saved.append(label)
+            except Exception as e:
+                failed.append(f"{label}: {e}")
+                print(f"[SAVE ERROR] {label}: {e}")
+                import traceback
+                traceback.print_exc()
 
-        # Cellpose
-        export_cellpose_npy(
-            instance_mask,
-            image,
-            path=str(dirs["cellpose"] / f"{filename}_cellpose.npy")
-        )
+        # Statistics CSV
+        stats_rows = []
+        try:
+            print(f"[SAVE] statistics_csv...")
+            stats_rows = export_cell_statistics_csv(
+                instance_mask,
+                self._accepted_masks,
+                path=str(
+                    dirs["statistics"] /
+                    f"{filename}_statistics.csv"
+                ),
+                uncertain_ids=uncertain_ids
+            )
+            saved.append("statistics_csv")
+        except Exception as e:
+            failed.append(f"statistics_csv: {e}")
+            print(f"[SAVE ERROR] statistics_csv: {e}")
+            import traceback
+            traceback.print_exc()
 
-        # Per-cell statistics CSV
-        stats_rows = export_cell_statistics_csv(
-            instance_mask,
-            self._accepted_masks,
-            path=str(dirs["statistics"] / f"{filename}_statistics.csv")
-        )
+        # Summary JSON
+        try:
+            print(f"[SAVE] summary_json...")
+            export_summary_json(
+                instance_mask,
+                self._accepted_masks,
+                stats_rows or [],
+                path=str(
+                    dirs["statistics"] /
+                    f"{filename}_summary.json"
+                ),
+                uncertain_ids=uncertain_ids
+            )
+            saved.append("summary_json")
+        except Exception as e:
+            failed.append(f"summary_json: {e}")
+            print(f"[SAVE ERROR] summary_json: {e}")
+            import traceback
+            traceback.print_exc()
 
-        # Overall summary JSON
-        export_summary_json(
-            instance_mask,
-            self._accepted_masks,
-            stats_rows or [],
-            path=str(dirs["statistics"] / f"{filename}_summary.json")
-        )
+        # Session
+        try:
+            print(f"[SAVE] session...")
+            self._save_session(
+                str(dirs["session"] / filename)
+            )
+            saved.append("session")
+        except Exception as e:
+            failed.append(f"session: {e}")
+            print(f"[SAVE ERROR] session: {e}")
+            import traceback
+            traceback.print_exc()
 
-        # Session file
-        self._save_session(
-            str(dirs["session"] / filename)
-        )
+        print(f"\n[SAVE] Saved: {saved}")
+        print(f"[SAVE] Failed: {failed}")
 
-        n = len(self._accepted_masks)
-        self._status_label.value = (
-            f"Saved {n} masks!\n"
-            f"Folder: {base_dir.name}"
-        )
+        n         = len(self._accepted_masks)
+        n_certain = n - len(self._uncertain_masks)
+        n_uncert  = len(self._uncertain_masks)
+
+        if failed:
+            self._status_label.value = (
+                f"Partial save: {len(saved)}/9\n"
+                f"Failed: {len(failed)}\n"
+                f"Check terminal."
+            )
+        else:
+            self._status_label.value = (
+                f"Saved {n} masks!\n"
+                f"Certain: {n_certain} | "
+                f"Uncertain: {n_uncert}"
+            )
 
     def _save_session(self, save_stem: str):
+        """Save session including uncertain mask IDs."""
         cell_ids = np.array(
             list(self._accepted_masks.keys()), dtype=np.int32
+        )
+        uncertain_ids = np.array(
+            list(self._uncertain_masks.keys()), dtype=np.int32
         )
         polygons = np.empty(len(cell_ids), dtype=object)
         for i, cid in enumerate(cell_ids):
@@ -597,6 +793,7 @@ class MaskGenWidget(Container):
             f"{save_stem}_session.npz",
             instance_mask=self._build_mask(),
             cell_ids=cell_ids,
+            uncertain_ids=uncertain_ids,
             next_cell_id=np.array([self._next_cell_id]),
         )
         np.save(
@@ -610,8 +807,7 @@ class MaskGenWidget(Container):
     # ------------------------------------------------------------------
 
     def _load_session(self):
-        from skimage.draw import polygon as skimage_polygon
-
+        """Load previous session including uncertain flags."""
         image_layers = [
             l for l in self._viewer.layers
             if isinstance(l, Image)
@@ -620,8 +816,8 @@ class MaskGenWidget(Container):
             self._status_label.value = "Open image first!"
             return
 
-        base_dir  = Path(self._save_dir_input.value.strip())
-        filename  = (
+        base_dir      = Path(self._save_dir_input.value.strip())
+        filename      = (
             self._filename_input.value.strip() or "cell_masks"
         )
         session_dir   = base_dir / "sessions"
@@ -649,6 +845,15 @@ class MaskGenWidget(Container):
                 int(cid): polygons[i]
                 for i, cid in enumerate(cell_ids)
             }
+
+            # Restore uncertain masks
+            uncertain_ids = session.get("uncertain_ids", [])
+            self._uncertain_masks = {
+                int(cid): self._accepted_masks[int(cid)]
+                for cid in uncertain_ids
+                if int(cid) in self._accepted_masks
+            }
+
             self._image_shape = self._get_image_shape(
                 image_layers[0]
             )
@@ -668,19 +873,27 @@ class MaskGenWidget(Container):
                 opacity=0.7
             )
 
-            # Rebuild drawing layer with green polygons
+            # Rebuild drawing layer
+            # Certain = green, uncertain = orange
             drawing = self._viewer.add_shapes(
                 name="Draw Polygons Here",
-                edge_color="green",
-                face_color=[0, 1, 0, 0.1],
+                edge_color="cyan",
+                face_color=[0, 1, 1, 0.15],
                 edge_width=2,
             )
-            for poly in self._accepted_masks.values():
-                drawing.add_polygons(
-                    [poly],
-                    edge_color="green",
-                    face_color=[0, 1, 0, 0.1],
-                )
+            for cid, poly in self._accepted_masks.items():
+                if cid in self._uncertain_masks:
+                    drawing.add_polygons(
+                        [poly],
+                        edge_color=[1.0, 0.5, 0.0, 1.0],
+                        face_color=[1.0, 0.5, 0.0, 0.15],
+                    )
+                else:
+                    drawing.add_polygons(
+                        [poly],
+                        edge_color="green",
+                        face_color=[0, 1, 0, 0.1],
+                    )
 
             # Move Labels below Shapes
             li = self._viewer.layers.index("Instance Masks")
@@ -690,19 +903,23 @@ class MaskGenWidget(Container):
 
             self._viewer.layers.selection.active = drawing
 
-            # Restore cell labels if checkbox is on
             if self._labels_checkbox.value:
                 self._update_cell_labels()
 
-            self._accept_button.enabled = True
-            self._reject_button.enabled = True
-            self._undo_button.enabled   = True
-            self._save_button.enabled   = True
+            # Keep start disabled - mid session
+            self._start_button.enabled     = False
+            self._accept_button.enabled    = True
+            self._reject_button.enabled    = True
+            self._uncertain_button.enabled = True
+            self._undo_button.enabled      = True
+            self._save_button.enabled      = True
 
             self._update_counter()
-            n = len(self._accepted_masks)
+            n       = len(self._accepted_masks)
+            n_uncert = len(self._uncertain_masks)
             self._status_label.value = (
-                f"Loaded {n} masks.\n"
+                f"Loaded {n} masks "
+                f"({n_uncert} uncertain).\n"
                 f"Continue drawing."
             )
 

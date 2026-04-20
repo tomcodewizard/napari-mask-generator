@@ -121,28 +121,45 @@ def export_coco_json(
         accepted_masks: Dict[int, np.ndarray],
         image_shape: tuple,
         image_filename: str = "image.tiff",
-        path: str = "annotations.json"
+        path: str = "annotations.json",
+        uncertain_ids: set = None
 ):
-    """COCO instance segmentation format."""
-    path = str(Path(path).with_suffix(".json"))
-    H, W = image_shape[:2]
+    """
+    COCO instance segmentation format.
+    Uncertain cells are flagged with:
+      - iscrowd = 1        (DL frameworks ignore these)
+      - category_id = 2    (uncertain_cell category)
+      - uncertain = True   (extra explicit flag)
+    """
+    uncertain_ids = uncertain_ids or set()
+    path          = str(Path(path).with_suffix(".json"))
+    H, W          = image_shape[:2]
 
     coco = {
         "info": {
-            "description": "Cell mask annotations",
+            "description":  "Cell mask annotations",
             "date_created": datetime.now().isoformat(),
-            "version": "1.0"
+            "version":      "1.0"
         },
         "licenses": [],
         "categories": [
-            {"id": 1, "name": "cell", "supercategory": "cell"}
+            {
+                "id":           1,
+                "name":         "cell",
+                "supercategory": "cell"
+            },
+            {
+                "id":           2,
+                "name":         "uncertain_cell",
+                "supercategory": "cell"
+            }
         ],
         "images": [
             {
-                "id": 1,
+                "id":        1,
                 "file_name": image_filename,
-                "height": H,
-                "width": W
+                "height":    H,
+                "width":     W
             }
         ],
         "annotations": []
@@ -164,23 +181,44 @@ def export_coco_json(
         rmin, rmax = np.where(rows)[0][[0, -1]]
         cmin, cmax = np.where(cols)[0][[0, -1]]
 
+        is_uncertain = cell_id in uncertain_ids
+
         coco["annotations"].append({
             "id":           int(cell_id),
             "image_id":     1,
-            "category_id":  1,
+            # category_id=2 flags uncertain to DL framework
+            "category_id":  2 if is_uncertain else 1,
             "segmentation": [segmentation],
             "area":         float(np.sum(cell_mask)),
             "bbox": [
-                float(cmin), float(rmin),
-                float(cmax - cmin), float(rmax - rmin)
+                float(cmin),
+                float(rmin),
+                float(cmax - cmin),
+                float(rmax - rmin)
             ],
-            "iscrowd": 0
+            # iscrowd=1 tells DL frameworks to ignore
+            # this annotation in loss calculation
+            "iscrowd":      1 if is_uncertain else 0,
+            # Extra explicit flag for clarity
+            "uncertain":    bool(is_uncertain)
         })
+
+    # Summary counts
+    n_total     = len(accepted_masks)
+    n_uncertain = len(uncertain_ids)
+    n_certain   = n_total - n_uncertain
+
+    coco["info"]["total_cells"]     = n_total
+    coco["info"]["certain_cells"]   = n_certain
+    coco["info"]["uncertain_cells"] = n_uncertain
 
     with open(path, "w") as f:
         json.dump(coco, f, indent=2)
-    print(f"Saved COCO JSON:        {path} "
-          f"({len(accepted_masks)} cells)")
+
+    print(f"Saved COCO JSON:        {path}")
+    print(f"  Total cells:     {n_total}")
+    print(f"  Certain cells:   {n_certain}")
+    print(f"  Uncertain cells: {n_uncertain}")
 
 
 def export_cellpose_npy(
