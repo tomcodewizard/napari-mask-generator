@@ -20,6 +20,7 @@ class MaskGenWidget(Container):
         self._viewer          = viewer
         self._accepted_masks  = {}
         self._uncertain_masks = {}
+        self._boundary_masks  = {}
         self._next_cell_id    = 1
         self._image_shape     = None
 
@@ -72,6 +73,11 @@ class MaskGenWidget(Container):
         self._uncertain_button = PushButton(
             label="Uncertain (flag cell)"
         )
+        self._boundary_button = PushButton(
+            label="Boundary Cell (exclude)"
+        )
+        self._boundary_button.native.setMaximumWidth(260)
+        self._boundary_button.enabled = False
         self._undo_button      = PushButton(label="Undo Last")
         self._save_button      = PushButton(label="Save Masks")
         self._load_button      = PushButton(label="Load Session")
@@ -102,6 +108,7 @@ class MaskGenWidget(Container):
             self._accept_button,
             self._reject_button,
             self._uncertain_button,
+            self._boundary_button,
             self._undo_button,
             self._save_button,
             self._load_button,
@@ -117,6 +124,7 @@ class MaskGenWidget(Container):
             (self._undo_button,      self._undo_last),
             (self._save_button,      self._save_masks),
             (self._load_button,      self._load_session),
+            (self._boundary_button, self._mark_boundary),
         ]:
             try:
                 btn.clicked.disconnect()
@@ -213,10 +221,6 @@ class MaskGenWidget(Container):
     # ------------------------------------------------------------------
 
     def _update_cell_labels(self):
-        """
-        Show or hide cell name labels as a Points layer.
-        Certain cells labelled white, uncertain cells orange.
-        """
         from skimage.measure import regionprops
 
         if "Cell Labels" in self._viewer.layers:
@@ -243,18 +247,19 @@ class MaskGenWidget(Container):
                 p = props[cell_id]
                 centroids.append([p.centroid[0], p.centroid[1]])
                 text_labels.append(f"Cell {cell_id}")
-                # Orange for uncertain, white for certain
-                text_colors.append(
-                    "orange"
-                    if cell_id in self._uncertain_masks
-                    else "white"
-                )
+
+                # Colour by category
+                if cell_id in self._boundary_masks:
+                    text_colors.append("pink")
+                elif cell_id in self._uncertain_masks:
+                    text_colors.append("orange")
+                else:
+                    text_colors.append("white")
 
         if not centroids:
             return
 
         centroids = np.array(centroids)
-
         self._viewer.add_points(
             centroids,
             name="Cell Labels",
@@ -268,7 +273,6 @@ class MaskGenWidget(Container):
             opacity=1.0,
         )
 
-        # Move to top
         if "Cell Labels" in self._viewer.layers:
             n  = len(self._viewer.layers)
             li = self._viewer.layers.index("Cell Labels")
@@ -358,6 +362,7 @@ class MaskGenWidget(Container):
 
         self._accepted_masks  = {}
         self._uncertain_masks = {}
+        self._boundary_masks  = {}
         self._next_cell_id    = 1
         self._update_counter()
 
@@ -368,12 +373,91 @@ class MaskGenWidget(Container):
         self._uncertain_button.enabled = True
         self._save_button.enabled      = True
         self._undo_button.enabled      = False
+        self._boundary_button.enabled = True
 
         self._status_label.value = (
             "Select polygon tool in toolbar.\n"
             "Draw polygon, double-click to finish.\n"
             "Then click Accept, Reject or Uncertain."
         )
+
+
+    # ------------------------------------------------------------------
+    # Mark Uncertain
+    # ------------------------------------------------------------------
+    def _mark_uncertain(self):
+        """
+        Mark last drawn polygon as uncertain.
+        Stored in both accepted_masks and uncertain_masks.
+        Displayed orange. Flagged as iscrowd=1 in COCO export.
+        DL frameworks ignore iscrowd=1 during training.
+        """
+        from skimage.draw import polygon as skimage_polygon
+
+        if "Draw Polygons Here" not in self._viewer.layers:
+            self._status_label.value = "Click Start Drawing first!"
+            return
+
+        drawing = self._viewer.layers["Draw Polygons Here"]
+        n       = len(drawing.data)
+
+        if n == 0:
+            self._status_label.value = "Draw a polygon first!"
+            return
+
+        poly   = drawing.data[-1].copy()
+        coords = poly[:, :2].astype(int)
+        h, w   = self._image_shape
+
+        coords[:,0] = np.clip(coords[:,0], 0, h-1)
+        coords[:,1] = np.clip(coords[:,1], 0, w-1)
+
+        rr, cc = skimage_polygon(coords[:,0], coords[:,1], (h,w))
+
+        if len(rr) == 0:
+            self._status_label.value = (
+                "Polygon too small! Draw larger."
+            )
+            return
+
+        cell_id = self._next_cell_id
+
+        # Store in BOTH dicts
+        self._accepted_masks[cell_id]  = poly
+        self._uncertain_masks[cell_id] = poly
+
+        self._update_labels_layer()
+
+        if self._labels_checkbox.value:
+            self._update_cell_labels()
+
+        self._zoom_to_last_accepted()
+
+        # Turn polygon ORANGE
+        try:
+            idx     = n - 1
+            ec      = np.array(drawing.edge_color)
+            fc      = np.array(drawing.face_color)
+            ec[idx] = [1.0, 0.5, 0.0, 1.0]
+            fc[idx] = [1.0, 0.5, 0.0, 0.15]
+            drawing.edge_color = ec
+            drawing.face_color = fc
+        except Exception as e:
+            print(f"Recolour error: {e}")
+
+        self._viewer.layers.selection.active = drawing
+        self._next_cell_id   += 1
+        self._undo_button.enabled = True
+        self._update_counter()
+        self._status_label.value = (
+            f"Cell {cell_id} flagged uncertain (orange).\n"
+            f"Will be ignored in DL training.\n"
+            f"Next label: {self._next_cell_id}"
+        )
+        print(f"[UNCERTAIN] cell_id={cell_id}")
+
+
+
 
     # ------------------------------------------------------------------
     # Accept
@@ -447,12 +531,13 @@ class MaskGenWidget(Container):
     # Mark Uncertain
     # ------------------------------------------------------------------
 
-    def _mark_uncertain(self):
+    def _mark_boundary(self):
         """
-        Mark last drawn polygon as uncertain.
-        Stored in both accepted_masks and uncertain_masks.
-        Displayed orange. Flagged as iscrowd=1 in COCO export.
-        DL frameworks ignore iscrowd=1 during training.
+        Mark last polygon as a boundary/edge cell.
+        Kept in instance mask with its label ID.
+        Flagged in exports so downstream tools know
+        it is a partial cell.
+        Displayed in pink.
         """
         from skimage.draw import polygon as skimage_polygon
 
@@ -475,18 +560,16 @@ class MaskGenWidget(Container):
         coords[:,1] = np.clip(coords[:,1], 0, w-1)
 
         rr, cc = skimage_polygon(coords[:,0], coords[:,1], (h,w))
-
         if len(rr) == 0:
-            self._status_label.value = (
-                "Polygon too small! Draw larger."
-            )
+            self._status_label.value = "Polygon too small!"
             return
 
         cell_id = self._next_cell_id
 
-        # Store in BOTH dicts
-        self._accepted_masks[cell_id]  = poly
-        self._uncertain_masks[cell_id] = poly
+        # Store in accepted AND boundary dicts
+        # Kept in mask but flagged in exports
+        self._accepted_masks[cell_id] = poly
+        self._boundary_masks[cell_id] = poly
 
         self._update_labels_layer()
 
@@ -495,13 +578,13 @@ class MaskGenWidget(Container):
 
         self._zoom_to_last_accepted()
 
-        # Turn polygon ORANGE
+        # Turn polygon PINK
         try:
             idx     = n - 1
             ec      = np.array(drawing.edge_color)
             fc      = np.array(drawing.face_color)
-            ec[idx] = [1.0, 0.5, 0.0, 1.0]
-            fc[idx] = [1.0, 0.5, 0.0, 0.15]
+            ec[idx] = [1.0, 0.4, 0.7, 1.0]
+            fc[idx] = [1.0, 0.4, 0.7, 0.15]
             drawing.edge_color = ec
             drawing.face_color = fc
         except Exception as e:
@@ -512,11 +595,12 @@ class MaskGenWidget(Container):
         self._undo_button.enabled = True
         self._update_counter()
         self._status_label.value = (
-            f"Cell {cell_id} flagged uncertain (orange).\n"
-            f"Will be ignored in DL training.\n"
+            f"Cell {cell_id} marked as boundary (pink).\n"
+            f"Kept in mask, flagged in exports.\n"
             f"Next label: {self._next_cell_id}"
         )
-        print(f"[UNCERTAIN] cell_id={cell_id}")
+        print(f"[BOUNDARY] cell_id={cell_id}")
+
 
     # ------------------------------------------------------------------
     # Reject
@@ -539,7 +623,6 @@ class MaskGenWidget(Container):
     # ------------------------------------------------------------------
 
     def _undo_last(self):
-        """Remove last accepted mask (certain or uncertain)."""
         if not self._accepted_masks:
             self._status_label.value = "Nothing to undo."
             return
@@ -547,9 +630,13 @@ class MaskGenWidget(Container):
         last_id = max(self._accepted_masks.keys())
         del self._accepted_masks[last_id]
 
-        # Also remove from uncertain if it was flagged
+        # Remove from uncertain if flagged
         if last_id in self._uncertain_masks:
             del self._uncertain_masks[last_id]
+
+        # Remove from boundary if flagged
+        if last_id in self._boundary_masks:
+            del self._boundary_masks[last_id]
 
         self._next_cell_id = last_id
 
@@ -633,6 +720,7 @@ class MaskGenWidget(Container):
 
         # Uncertain IDs for flagging
         uncertain_ids = set(self._uncertain_masks.keys())
+        boundary_ids  = set(self._boundary_masks.keys())
 
         for label, fn, args, kwargs in [
             (
@@ -681,7 +769,8 @@ class MaskGenWidget(Container):
                         dirs["coco"] /
                         f"{filename}_coco_annotation.json"
                     ),
-                    "uncertain_ids":  uncertain_ids
+                    "uncertain_ids":  uncertain_ids,
+                    "boundary_ids":  boundary_ids
                 }
             ),
             (
@@ -715,7 +804,8 @@ class MaskGenWidget(Container):
                     dirs["statistics"] /
                     f"{filename}_statistics.csv"
                 ),
-                uncertain_ids=uncertain_ids
+                uncertain_ids=uncertain_ids,
+                boundary_ids=boundary_ids
             )
             saved.append("statistics_csv")
         except Exception as e:
@@ -735,7 +825,8 @@ class MaskGenWidget(Container):
                     dirs["statistics"] /
                     f"{filename}_summary.json"
                 ),
-                uncertain_ids=uncertain_ids
+                uncertain_ids=uncertain_ids,
+                boundary_ids=boundary_ids
             )
             saved.append("summary_json")
         except Exception as e:
@@ -778,12 +869,14 @@ class MaskGenWidget(Container):
             )
 
     def _save_session(self, save_stem: str):
-        """Save session including uncertain mask IDs."""
-        cell_ids = np.array(
+        cell_ids     = np.array(
             list(self._accepted_masks.keys()), dtype=np.int32
         )
         uncertain_ids = np.array(
             list(self._uncertain_masks.keys()), dtype=np.int32
+        )
+        boundary_ids  = np.array(
+            list(self._boundary_masks.keys()), dtype=np.int32
         )
         polygons = np.empty(len(cell_ids), dtype=object)
         for i, cid in enumerate(cell_ids):
@@ -794,6 +887,7 @@ class MaskGenWidget(Container):
             instance_mask=self._build_mask(),
             cell_ids=cell_ids,
             uncertain_ids=uncertain_ids,
+            boundary_ids=boundary_ids,        # ADD
             next_cell_id=np.array([self._next_cell_id]),
         )
         np.save(
@@ -846,11 +940,26 @@ class MaskGenWidget(Container):
                 for i, cid in enumerate(cell_ids)
             }
 
+            try:
+                uncertain_ids = session["uncertain_ids"]
+            except KeyError:
+                uncertain_ids = []
+
+            try:
+                boundary_ids = session["boundary_ids"]
+            except KeyError:
+                boundary_ids = []
+
             # Restore uncertain masks
-            uncertain_ids = session.get("uncertain_ids", [])
             self._uncertain_masks = {
                 int(cid): self._accepted_masks[int(cid)]
                 for cid in uncertain_ids
+                if int(cid) in self._accepted_masks
+            }
+            # Restore boundary masks
+            self._boundary_masks = {
+                int(cid): self._accepted_masks[int(cid)]
+                for cid in boundary_ids
                 if int(cid) in self._accepted_masks
             }
 
@@ -882,7 +991,13 @@ class MaskGenWidget(Container):
                 edge_width=2,
             )
             for cid, poly in self._accepted_masks.items():
-                if cid in self._uncertain_masks:
+                if cid in self._boundary_masks:
+                    drawing.add_polygons(
+                        [poly],
+                        edge_color=[1.0, 0.4, 0.7, 1.0],  # pink
+                        face_color=[1.0, 0.4, 0.7, 0.15],
+                    )
+                elif cid in self._uncertain_masks:
                     drawing.add_polygons(
                         [poly],
                         edge_color=[1.0, 0.5, 0.0, 1.0],
@@ -917,9 +1032,11 @@ class MaskGenWidget(Container):
             self._update_counter()
             n       = len(self._accepted_masks)
             n_uncert = len(self._uncertain_masks)
+            n_boundary = len(self._boundary_masks)
             self._status_label.value = (
                 f"Loaded {n} masks "
-                f"({n_uncert} uncertain).\n"
+                f"({n_uncert} uncertain, "
+                f"{n_boundary} boundary).\n"
                 f"Continue drawing."
             )
 
