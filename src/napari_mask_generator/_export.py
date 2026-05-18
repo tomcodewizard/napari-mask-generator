@@ -122,19 +122,13 @@ def export_coco_json(
         image_shape: tuple,
         image_filename: str = "image.tiff",
         path: str = "annotations.json",
-        uncertain_ids: set = None
+        uncertain_ids: set = None,
+        boundary_ids: set = None          # ADD THIS
 ):
-    """
-    COCO instance segmentation format.
-    Uncertain cells are flagged with:
-      - iscrowd = 1        (DL frameworks ignore these)
-      - category_id = 2    (uncertain_cell category)
-      - uncertain = True   (extra explicit flag)
-    """
     uncertain_ids = uncertain_ids or set()
+    boundary_ids  = boundary_ids  or set()   # ADD THIS
     path          = str(Path(path).with_suffix(".json"))
     H, W          = image_shape[:2]
-
     coco = {
         "info": {
             "description":  "Cell mask annotations",
@@ -144,13 +138,18 @@ def export_coco_json(
         "licenses": [],
         "categories": [
             {
-                "id":           1,
-                "name":         "cell",
+                "id":            1,
+                "name":          "cell",
                 "supercategory": "cell"
             },
             {
-                "id":           2,
-                "name":         "uncertain_cell",
+                "id":            2,
+                "name":          "uncertain_cell",
+                "supercategory": "cell"
+            },
+            {
+                "id":            3,              # ADD THIS
+                "name":          "boundary_cell",
                 "supercategory": "cell"
             }
         ],
@@ -164,31 +163,33 @@ def export_coco_json(
         ],
         "annotations": []
     }
-
     for cell_id, polygon_data in accepted_masks.items():
         coords       = polygon_data[:, :2]
         segmentation = [
             float(v) for pt in coords
             for v in (pt[1], pt[0])
         ]
-
         cell_mask = instance_mask == cell_id
         if not np.any(cell_mask):
             continue
-
         rows = np.any(cell_mask, axis=1)
         cols = np.any(cell_mask, axis=0)
         rmin, rmax = np.where(rows)[0][[0, -1]]
         cmin, cmax = np.where(cols)[0][[0, -1]]
-
         is_uncertain = cell_id in uncertain_ids
-
+        is_boundary  = cell_id in boundary_ids    # ADD THIS
+        # Determine category_id
+        if is_uncertain:
+            category_id = 2
+        elif is_boundary:
+            category_id = 3                       # ADD THIS
+        else:
+            category_id = 1
         coco["annotations"].append({
             "id":           int(cell_id),
             "image_id":     1,
-            # category_id=2 flags uncertain to DL framework
-            "category_id":  2 if is_uncertain else 1,
-            "cell": 1,
+            "category_id":  category_id,          # UPDATED
+            "cell":         1,
             "segmentation": [segmentation],
             "area":         float(np.sum(cell_mask)),
             "bbox": [
@@ -197,29 +198,25 @@ def export_coco_json(
                 float(cmax - cmin),
                 float(rmax - rmin)
             ],
-            # iscrowd=1 tells DL frameworks to ignore
-            # this annotation in loss calculation
             "iscrowd":      1 if is_uncertain else 0,
-            # Extra explicit flag for clarity
-            "uncertain":    bool(is_uncertain)
+            "uncertain":    bool(is_uncertain),
+            "boundary":     bool(is_boundary)     # ADD THIS
         })
-
-    # Summary counts
     n_total     = len(accepted_masks)
     n_uncertain = len(uncertain_ids)
-    n_certain   = n_total - n_uncertain
-
+    n_boundary  = len(boundary_ids)               # ADD THIS
+    n_certain   = n_total - n_uncertain - n_boundary
     coco["info"]["total_cells"]     = n_total
     coco["info"]["certain_cells"]   = n_certain
     coco["info"]["uncertain_cells"] = n_uncertain
-
+    coco["info"]["boundary_cells"]  = n_boundary  # ADD THIS
     with open(path, "w") as f:
         json.dump(coco, f, indent=2)
-
     print(f"Saved COCO JSON:        {path}")
     print(f"  Total cells:     {n_total}")
     print(f"  Certain cells:   {n_certain}")
     print(f"  Uncertain cells: {n_uncertain}")
+    print(f"  Boundary cells:  {n_boundary}")      # ADD THIS
 
 
 def export_cellpose_npy(
@@ -248,28 +245,24 @@ def export_cellpose_npy(
 def export_cell_statistics_csv(
         instance_mask: np.ndarray,
         accepted_masks: Dict[int, np.ndarray],
-        path: str
+        path: str,
+        uncertain_ids: set = None,        # ADD THIS
+        boundary_ids: set = None          # ADD THIS
 ):
-    """
-    Per-cell statistics CSV.
-    One row per cell with all measurements.
-    """
     from skimage.measure import regionprops
-
+    uncertain_ids = uncertain_ids or set()    # ADD THIS
+    boundary_ids  = boundary_ids  or set()   # ADD THIS
     path  = str(Path(path).with_suffix(".csv"))
     props = {
         r.label: r
         for r in regionprops(instance_mask.astype(np.int32))
     }
-
     rows = []
     for cell_id, polygon_data in sorted(accepted_masks.items()):
         row = {"cell_id": cell_id}
-
         if cell_id in props:
             p    = props[cell_id]
             area = int(p.area)
-
             row["pixel_area"]          = area
             row["centroid_row"]        = round(p.centroid[0], 2)
             row["centroid_col"]        = round(p.centroid[1], 2)
@@ -292,13 +285,11 @@ def export_cell_statistics_csv(
             row["aspect_ratio"]        = round(
                 p.major_axis_length / p.minor_axis_length, 4
             ) if p.minor_axis_length > 0 else None
-
             h_bb = p.bbox[2] - p.bbox[0]
             w_bb = p.bbox[3] - p.bbox[1]
             row["bbox_aspect_ratio"]   = round(
                 w_bb / h_bb, 4
             ) if h_bb > 0 else None
-
         else:
             for key in [
                 "pixel_area", "centroid_row", "centroid_col",
@@ -310,7 +301,6 @@ def export_cell_statistics_csv(
                 "aspect_ratio", "bbox_aspect_ratio"
             ]:
                 row[key] = None
-
         # Polygon info
         row["n_polygon_vertices"] = len(polygon_data)
         coords    = polygon_data[:, :2]
@@ -319,19 +309,23 @@ def export_cell_statistics_csv(
         close     = coords[-1] - coords[0]
         perimeter += float(np.sqrt((close**2).sum()))
         row["polygon_perimeter_px"] = round(perimeter, 2)
-
+        # ADD THESE THREE LINES
+        row["is_uncertain"] = bool(cell_id in uncertain_ids)
+        row["is_boundary"]  = bool(cell_id in boundary_ids)
+        row["cell_type"]    = (
+            "uncertain" if cell_id in uncertain_ids
+            else "boundary" if cell_id in boundary_ids
+            else "certain"
+        )
         rows.append(row)
-
     if not rows:
         print("No cells to export.")
         return []
-
     fieldnames = list(rows[0].keys())
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-
     print(f"Saved statistics CSV:   {path}")
     return rows
 
@@ -340,14 +334,13 @@ def export_summary_json(
         instance_mask: np.ndarray,
         accepted_masks: Dict[int, np.ndarray],
         stats_rows: list,
-        path: str
+        path: str,
+        uncertain_ids: set = None,        # ADD THIS
+        boundary_ids: set = None          # ADD THIS
 ):
-    """
-    Overall summary statistics as JSON.
-    Contains dataset-level aggregates not per-cell data.
-    """
+    uncertain_ids = uncertain_ids or set()    # ADD THIS
+    boundary_ids  = boundary_ids  or set()   # ADD THIS
     path = str(Path(path).with_suffix(".json"))
-
     areas = [
         r["pixel_area"] for r in stats_rows
         if r.get("pixel_area") is not None
@@ -364,12 +357,18 @@ def export_summary_json(
         r["minor_axis_length"] for r in stats_rows
         if r.get("minor_axis_length") is not None
     ]
-
+    n_total     = len(accepted_masks)
+    n_uncertain = len(uncertain_ids)
+    n_boundary  = len(boundary_ids)
+    n_certain   = n_total - n_uncertain - n_boundary    # UPDATED
     summary = {
         "annotation_info": {
             "date_created":       datetime.now().isoformat(),
             "image_shape":        list(instance_mask.shape),
-            "total_cells":        len(accepted_masks),
+            "total_cells":        n_total,
+            "certain_cells":      n_certain,              # ADD THIS
+            "uncertain_cells":    n_uncertain,            # ADD THIS
+            "boundary_cells":     n_boundary,             # ADD THIS
             "total_annotated_px": int(np.sum(instance_mask > 0)),
             "background_px":      int(np.sum(instance_mask == 0)),
             "coverage_fraction":  round(
@@ -378,33 +377,33 @@ def export_summary_json(
             ),
         },
         "area_statistics_px": {
-            "min":    int(min(areas))           if areas else None,
-            "max":    int(max(areas))           if areas else None,
-            "mean":   round(np.mean(areas), 2)  if areas else None,
+            "min":    int(min(areas))            if areas else None,
+            "max":    int(max(areas))            if areas else None,
+            "mean":   round(np.mean(areas), 2)   if areas else None,
             "median": round(np.median(areas), 2) if areas else None,
-            "std":    round(np.std(areas), 2)   if areas else None,
-            "total":  int(sum(areas))           if areas else None,
+            "std":    round(np.std(areas), 2)    if areas else None,
+            "total":  int(sum(areas))            if areas else None,
         },
         "shape_statistics": {
-            "mean_eccentricity":     round(
+            "mean_eccentricity":  round(
                 np.mean(eccentricities), 4
             ) if eccentricities else None,
-            "mean_major_axis_px":    round(
+            "mean_major_axis_px": round(
                 np.mean(major_axes), 2
             ) if major_axes else None,
-            "mean_minor_axis_px":    round(
+            "mean_minor_axis_px": round(
                 np.mean(minor_axes), 2
             ) if minor_axes else None,
-            "mean_aspect_ratio":     round(
+            "mean_aspect_ratio":  round(
                 np.mean(major_axes) / np.mean(minor_axes), 4
             ) if (major_axes and minor_axes and
                   np.mean(minor_axes) > 0) else None,
         },
-        "cell_ids": sorted(list(accepted_masks.keys())),
+        "cell_ids":          sorted(list(accepted_masks.keys())),
+        "uncertain_cell_ids": sorted(list(uncertain_ids)),  # ADD THIS
+        "boundary_cell_ids":  sorted(list(boundary_ids)),   # ADD THIS
     }
-
     with open(path, "w") as f:
         json.dump(summary, f, indent=2)
-
     print(f"Saved summary JSON:     {path}")
-    return summary 
+    return summary

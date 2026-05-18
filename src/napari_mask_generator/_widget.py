@@ -21,6 +21,8 @@ class MaskGenWidget(Container):
         self._accepted_masks  = {}
         self._uncertain_masks = {}
         self._boundary_masks  = {}
+        self._shape_index_to_cell_id = {}   # shape index → cell_id
+        self._cell_id_to_shape_index = {}   # cell_id → shape index
         self._next_cell_id    = 1
         self._image_shape     = None
 
@@ -216,6 +218,117 @@ class MaskGenWidget(Container):
 
         print(f"Labels layer updated: unique={np.unique(new_mask)}")
 
+
+
+    def _rebuild_shape_map(self):
+        """
+        Rebuild the bidirectional map between
+        shape indices and cell IDs.
+        Called after every accept/undo/load.
+        Shape order in drawing.data matches
+        insertion order of accepted masks.
+        """
+        self._shape_index_to_cell_id = {}
+        self._cell_id_to_shape_index = {}
+        if "Draw Polygons Here" not in self._viewer.layers:
+            return
+        drawing  = self._viewer.layers["Draw Polygons Here"]
+        cell_ids = sorted(self._accepted_masks.keys())
+        # The first N shapes correspond to accepted cells
+        # in order they were accepted
+        for shape_idx, cell_id in enumerate(cell_ids):
+            self._shape_index_to_cell_id[shape_idx] = cell_id
+            self._cell_id_to_shape_index[cell_id]   = shape_idx
+        print(f"[MAP] shape→cell: {self._shape_index_to_cell_id}")
+
+    def _connect_shape_deletion(self):
+        """
+        Connect napari Shapes layer deletion event
+        so deleting a shape removes the linked cell.
+        """
+        if "Draw Polygons Here" not in self._viewer.layers:
+            return
+        drawing = self._viewer.layers["Draw Polygons Here"]
+        # Disconnect any existing connection first
+        try:
+            drawing.events.data.disconnect(
+                self._on_shapes_data_changed
+            )
+        except Exception:
+            pass
+        drawing.events.data.connect(
+            self._on_shapes_data_changed
+        )
+        print("[CONNECT] Shape deletion listener connected.")
+
+    def _on_shapes_data_changed(self, event):
+        """
+        Called whenever shapes are added, removed or modified.
+        If a shape is deleted, remove the linked cell.
+        """
+        if "Draw Polygons Here" not in self._viewer.layers:
+            return
+        drawing      = self._viewer.layers["Draw Polygons Here"]
+        n_shapes_now = len(drawing.data)
+        n_accepted   = len(self._accepted_masks)
+        # Only act on deletion of an accepted shape
+        # (not on new drawings which add shapes)
+        if n_shapes_now < n_accepted:
+            # Work out which shape index was deleted
+            # by comparing current shapes to stored polygons
+            deleted_ids = self._find_deleted_cell_ids(drawing)
+            for cell_id in deleted_ids:
+                print(f"[DELETE] Shape deleted → removing cell {cell_id}")
+                if cell_id in self._accepted_masks:
+                    del self._accepted_masks[cell_id]
+                if cell_id in self._uncertain_masks:
+                    del self._uncertain_masks[cell_id]
+                if cell_id in self._boundary_masks:
+                    del self._boundary_masks[cell_id]
+            if deleted_ids:
+                # Rebuild next_cell_id
+                if self._accepted_masks:
+                    self._next_cell_id = (
+                        max(self._accepted_masks.keys()) + 1
+                    )
+                else:
+                    self._next_cell_id = 1
+                self._update_labels_layer()
+                self._update_cell_labels()
+                self._rebuild_shape_map()
+                self._update_counter()
+                self._status_label.value = (
+                    f"Cell(s) {deleted_ids} deleted via shape removal."
+                )
+
+    def _find_deleted_cell_ids(self, drawing) -> list:
+        """
+        Compare current shapes to stored polygons
+        to find which cell IDs have been deleted.
+        Uses shape vertex count + first vertex as fingerprint.
+        """
+        # Build fingerprints for current shapes
+        current_fingerprints = set()
+        for shape in drawing.data:
+            fp = (
+                len(shape),
+                round(float(shape[0, 0]), 2),
+                round(float(shape[0, 1]), 2)
+            )
+            current_fingerprints.add(fp)
+        # Find which accepted cells are no longer present
+        deleted = []
+        for cell_id, poly in self._accepted_masks.items():
+            fp = (
+                len(poly),
+                round(float(poly[0, 0]), 2),
+                round(float(poly[0, 1]), 2)
+            )
+            if fp not in current_fingerprints:
+                deleted.append(cell_id)
+        return deleted
+
+
     # ------------------------------------------------------------------
     # Cell Label Points Layer
     # ------------------------------------------------------------------
@@ -355,9 +468,10 @@ class MaskGenWidget(Container):
         drawing = self._viewer.add_shapes(
             name="Draw Polygons Here",
             edge_color="cyan",
-            face_color=[0, 1, 1, 0.15],
-            edge_width=2,
+            face_color=[0, 0, 0, 0.0],
+            edge_width=0,
         )
+
         self._viewer.layers.selection.active = drawing
 
         self._accepted_masks  = {}
@@ -380,6 +494,9 @@ class MaskGenWidget(Container):
             "Draw polygon, double-click to finish.\n"
             "Then click Accept, Reject or Uncertain."
         )
+
+        self._rebuild_shape_map()
+        self._connect_shape_deletion()
 
 
     # ------------------------------------------------------------------
@@ -438,10 +555,13 @@ class MaskGenWidget(Container):
             idx     = n - 1
             ec      = np.array(drawing.edge_color)
             fc      = np.array(drawing.face_color)
-            ec[idx] = [1.0, 0.5, 0.0, 1.0]
-            fc[idx] = [1.0, 0.5, 0.0, 0.15]
+            ec[idx] = [1.0, 0.5, 0.0, 1.0]  # orange edge
+            fc[idx] = [1.0, 0.5, 0.0, 0.15] # orange fill
             drawing.edge_color = ec
             drawing.face_color = fc
+            ew      = np.array(drawing.edge_width)
+            ew[idx] = 2.0
+            drawing.edge_width = ew
         except Exception as e:
             print(f"Recolour error: {e}")
 
@@ -456,6 +576,8 @@ class MaskGenWidget(Container):
         )
         print(f"[UNCERTAIN] cell_id={cell_id}")
 
+        self._rebuild_shape_map()
+        self._connect_shape_deletion()
 
 
 
@@ -511,10 +633,14 @@ class MaskGenWidget(Container):
             idx     = n - 1
             ec      = np.array(drawing.edge_color)
             fc      = np.array(drawing.face_color)
-            ec[idx] = [0, 1, 0, 1]
-            fc[idx] = [0, 1, 0, 0.15]
+            ec[idx] = [0, 1, 0, 1]          # green edge
+            fc[idx] = [0, 1, 0, 0.15]       # green fill
             drawing.edge_color = ec
             drawing.face_color = fc
+            # Set edge width for this specific shape
+            ew      = np.array(drawing.edge_width)
+            ew[idx] = 2.0                    # now visible
+            drawing.edge_width = ew
         except Exception as e:
             print(f"Recolour error: {e}")
 
@@ -527,6 +653,8 @@ class MaskGenWidget(Container):
             f"Next label: {self._next_cell_id}"
         )
 
+        self._rebuild_shape_map()
+        self._connect_shape_deletion()
     # ------------------------------------------------------------------
     # Mark Uncertain
     # ------------------------------------------------------------------
@@ -583,10 +711,13 @@ class MaskGenWidget(Container):
             idx     = n - 1
             ec      = np.array(drawing.edge_color)
             fc      = np.array(drawing.face_color)
-            ec[idx] = [1.0, 0.4, 0.7, 1.0]
-            fc[idx] = [1.0, 0.4, 0.7, 0.15]
+            ec[idx] = [1.0, 0.4, 0.7, 1.0]  # pink edge
+            fc[idx] = [1.0, 0.4, 0.7, 0.15] # pink fill
             drawing.edge_color = ec
             drawing.face_color = fc
+            ew      = np.array(drawing.edge_width)
+            ew[idx] = 2.0
+            drawing.edge_width = ew
         except Exception as e:
             print(f"Recolour error: {e}")
 
@@ -601,6 +732,8 @@ class MaskGenWidget(Container):
         )
         print(f"[BOUNDARY] cell_id={cell_id}")
 
+        self._rebuild_shape_map()
+        self._connect_shape_deletion()
 
     # ------------------------------------------------------------------
     # Reject
@@ -660,6 +793,8 @@ class MaskGenWidget(Container):
             f"Undone label {last_id}. Draw again."
         )
 
+        self._rebuild_shape_map()
+        self._connect_shape_deletion()
     # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
@@ -994,21 +1129,27 @@ class MaskGenWidget(Container):
                 if cid in self._boundary_masks:
                     drawing.add_polygons(
                         [poly],
-                        edge_color=[1.0, 0.4, 0.7, 1.0],  # pink
+                        edge_color=[1.0, 0.4, 0.7, 1.0],
                         face_color=[1.0, 0.4, 0.7, 0.15],
+                        edge_width=2,
                     )
                 elif cid in self._uncertain_masks:
                     drawing.add_polygons(
                         [poly],
                         edge_color=[1.0, 0.5, 0.0, 1.0],
                         face_color=[1.0, 0.5, 0.0, 0.15],
+                        edge_width=2,
                     )
                 else:
                     drawing.add_polygons(
                         [poly],
-                        edge_color="green",
-                        face_color=[0, 1, 0, 0.1],
+                        edge_color=[0, 1, 0, 1.0],
+                        face_color=[0, 1, 0, 0.15],
+                        edge_width=2,
                     )
+            # After the loop add:
+            self._rebuild_shape_map()
+            self._connect_shape_deletion()
 
             # Move Labels below Shapes
             li = self._viewer.layers.index("Instance Masks")
@@ -1045,3 +1186,7 @@ class MaskGenWidget(Container):
             print(f"Load error: {e}")
             import traceback
             traceback.print_exc()
+
+
+        self._rebuild_shape_map()
+        self._connect_shape_deletion()
